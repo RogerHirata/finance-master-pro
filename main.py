@@ -17,6 +17,22 @@ CONN_STR = (
 def get_db_connection():
     return pyodbc.connect(CONN_STR)
 
+# --- ROTA DE EXCLUSÃO (Movida para cima para evitar conflito de leitura do FastAPI) ---
+@app.get("/web/deletar/{id}")
+def web_deletar(id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Executa a exclusão no banco de dados
+    cursor.execute("DELETE FROM Transacoes WHERE id = ?", id)
+    
+    conn.commit()
+    conn.close()
+    
+    # Redireciona limpando os filtros para atualizar os gráficos e o histórico
+    return RedirectResponse(url="/", status_code=303)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard_executivo(
     edit_id: int = None, 
@@ -26,7 +42,7 @@ def dashboard_executivo(
     hoje = datetime.today()
     hoje_str = hoje.strftime('%Y-%m-%d')
     
-    # ALTERAÇÃO AQUI: Se não houver filtro na URL, define o período apenas para o DIA ATUAL
+    # Se não houver filtro na URL, define o período apenas para o DIA ATUAL
     if not data_inicio or data_inicio.strip() == "":
         data_inicio = hoje_str
     if not data_fim or data_fim.strip() == "":
@@ -35,19 +51,28 @@ def dashboard_executivo(
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Resumo Financeiro Geral Filtrado pelo Dia/Período
+    # 1. Resumo Financeiro Geral Filtrado pelo Dia/Período (Ignora a Categoria Poupança/Reserva)
     cursor.execute("""
-        SELECT SUM(valor) FROM Transacoes 
-        WHERE tipo = 'Receita' AND data_transacao BETWEEN ? AND ?
+        SELECT SUM(t.valor) 
+        FROM Transacoes t
+        LEFT JOIN Categorias c ON t.categoria_id = c.id
+        WHERE t.tipo = 'Receita' 
+          AND t.data_transacao BETWEEN ? AND ?
+          AND (LOWER(TRIM(c.nome)) <> 'poupança/reserva' OR c.nome IS NULL)
     """, data_inicio, data_fim)
     total_receitas = float(cursor.fetchone()[0] or 0.0)
     
     cursor.execute("""
-        SELECT SUM(valor) FROM Transacoes 
-        WHERE tipo = 'Despesa' AND data_transacao BETWEEN ? AND ?
+        SELECT SUM(t.valor) 
+        FROM Transacoes t
+        LEFT JOIN Categorias c ON t.categoria_id = c.id
+        WHERE t.tipo = 'Despesa' 
+          AND t.data_transacao BETWEEN ? AND ?
+          AND (LOWER(TRIM(c.nome)) <> 'poupança/reserva' OR c.nome IS NULL)
     """, data_inicio, data_fim)
     total_despesas = float(cursor.fetchone()[0] or 0.0)
     
+    # O Balanço do Período passa a ser calculado puramente com as entradas e saídas que não são poupança
     saldo = total_receitas - total_despesas
 
     # 2. Saldo Total da Poupança (Acumulado Histórico - Soma Receita, Subtrai Despesa)
@@ -65,24 +90,28 @@ def dashboard_executivo(
     """)
     total_poupanca = float(cursor.fetchone()[0] or 0.0)
     
-    # 3. Dados Gráfico 1: Rosca (Gastos por Categoria no Período)
+    # 3. Dados Gráfico 1: Rosca (Gastos por Categoria no Período - Ignora Poupança para focar em despesas reais)
     cursor.execute("""
         SELECT c.nome, SUM(t.valor) 
         FROM Transacoes t 
         JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE t.tipo = 'Despesa' AND t.data_transacao BETWEEN ? AND ?
+        WHERE t.tipo = 'Despesa' 
+          AND t.data_transacao BETWEEN ? AND ?
+          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
         GROUP BY c.nome
     """, data_inicio, data_fim)
     resumo_gastos = cursor.fetchall()
     labels_rosca = [r[0] for r in resumo_gastos]
     values_rosca = [float(r[1]) for r in resumo_gastos]
 
-    # 4. Dados Gráfico 2: Ranking Top 5
+    # 4. Dados Gráfico 2: Ranking Top 5 (Ignora Poupança)
     cursor.execute("""
         SELECT TOP 5 c.nome, SUM(t.valor) 
         FROM Transacoes t 
         JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE t.tipo = 'Despesa' AND t.data_transacao BETWEEN ? AND ?
+        WHERE t.tipo = 'Despesa' 
+          AND t.data_transacao BETWEEN ? AND ?
+          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
         GROUP BY c.nome 
         ORDER BY SUM(t.valor) DESC
     """, data_inicio, data_fim)
@@ -90,7 +119,7 @@ def dashboard_executivo(
     labels_rank = [r[0] for r in ranking]
     values_rank = [float(r[1]) for r in ranking]
 
-    # 5. Histórico de Transações do Período
+    # 5. Histórico de Transações do Período (Mantém a exibição da Poupança na tabela para controle do histórico)
     cursor.execute("""
         SELECT t.id, t.descricao, t.valor, t.tipo, c.nome, CONVERT(VARCHAR, t.data_transacao, 103) 
         FROM Transacoes t 
@@ -112,6 +141,33 @@ def dashboard_executivo(
     conn.close()
 
     data_padrao_form = edit_item[5].strftime('%Y-%m-%d') if edit_item else hoje_str
+
+    # Geração das linhas da tabela dinamicamente para evitar conflito com chaves da f-string
+    linhas_tabela = ""
+    for t in historico:
+        cor_tipo = "var(--success)" if t[3] == "Receita" else "var(--danger)"
+        linhas_tabela += f"""
+        <tr>
+            <td>{t[5]}</td>
+            <td>{t[1]}</td>
+            <td>{t[4]}</td>
+            <td style="color:{cor_tipo}">{t[3]}</td>
+            <td>R$ {float(t[2]):,.2f}</td>
+            <td class="action-icons">
+                <a href="/?edit_id={t[0]}&data_inicio={data_inicio}&data_fim={data_fim}" class="icon-edit"><i class="fas fa-edit"></i></a>
+                <a href="/web/deletar/{t[0]}" class="icon-del" onclick="return confirm('Excluir este lançamento?')"><i class="fas fa-trash"></i></a>
+            </td>
+        </tr>
+        """
+
+    # Geração das opções de categoria dinamicamente
+    opcoes_categorias = "".join([
+        f'<option value="{c[0]}" {"selected" if edit_item and edit_item[4]==c[0] else ""}>{c[1]}</option>' 
+        for c in categorias_lista
+    ])
+
+    titulo_formulario = "Editar Lançamento" if edit_item else "Novo Lançamento"
+    botao_cancelar = f'<a href="/" style="display:block; text-align:center; margin-top:0.8rem; font-size:0.8rem; color:var(--danger); text-decoration:none;">Cancelar Edição</a>' if edit_item else ""
 
     return f"""
     <!DOCTYPE html>
@@ -298,7 +354,7 @@ def dashboard_executivo(
                 </div>
 
                 <div class="content-box">
-                    <h4><i class="fas fa-plus-circle"></i> { "Editar Lançamento" if edit_item else "Novo Lançamento" }</h4>
+                    <h4><i class="fas fa-plus-circle"></i> {titulo_formulario}</h4>
                     <form action="/web/salvar" method="POST">
                         <input type="hidden" name="id" value="{edit_item[0] if edit_item else ""}">
                         
@@ -324,11 +380,11 @@ def dashboard_executivo(
                         <div class="form-group">
                             <label>Categoria</label>
                             <select name="categoria_id" style="width:100%">
-                                {"".join([f'<option value="{c[0]}" {"selected" if edit_item and edit_item[4]==c[0] else ""}>{c[1]}</option>' for c in categorias_lista])}
+                                {opcoes_categorias}
                             </select>
                         </div>
                         <button type="submit" class="btn-save">Salvar Registro</button>
-                        { '<a href="/" style="display:block; text-align:center; margin-top:0.8rem; font-size:0.8rem; color:var(--danger); text-decoration:none;">Cancelar Edição</a>' if edit_item else "" }
+                        {botao_cancelar}
                     </form>
                 </div>
             </div>
@@ -338,7 +394,7 @@ def dashboard_executivo(
                 <table>
                     <thead><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Tipo</th><th>Valor</th><th>Ações</th></tr></thead>
                     <tbody>
-                        {"".join([f'<tr><td>{t[5]}</td><td>{t[1]}</td><td>{t[4]}</td><td style="color:{"var(--success)" if t[3]=="Receita" else "var(--danger)"}">{t[3]}</td><td>R$ {float(t[2]):,.2f}</td><td class="action-icons"><a href="/?edit_id={t[0]}&data_inicio={data_inicio}&data_fim={data_fim}" class="icon-edit"><i class="fas fa-edit"></i></a><a href="/web/deletar/{t[0]}" class="icon-del" onclick="return confirm(\'Excluir este lançamento?\')"><i class="fas fa-trash"></i></a></td></tr>' for t in historico])}
+                        {linhas_tabela}
                     </tbody>
                 </table>
             </div>
@@ -401,15 +457,6 @@ def web_salvar(
             INSERT INTO Transacoes (descricao, valor, tipo, categoria_id, data_transacao) 
             VALUES (?, ?, ?, ?, ?)
         """, descricao, valor, tipo, categoria_id, data_transacao)
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/", status_code=303)
-
-@app.get("/web/deletar/{id}")
-def web_deletar(id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM Transacoes WHERE id = ?", id)
     conn.commit()
     conn.close()
     return RedirectResponse(url="/", status_code=303)
