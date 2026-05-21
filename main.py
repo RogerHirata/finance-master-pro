@@ -55,26 +55,34 @@ def dashboard_executivo(
     cursor.execute("""
         SELECT SUM(t.valor) 
         FROM Transacoes t
-        LEFT JOIN Categorias c ON t.categoria_id = c.id
+        JOIN Categorias c ON t.categoria_id = c.id
         WHERE t.tipo = 'Receita' 
           AND t.data_transacao BETWEEN ? AND ?
-          AND (LOWER(TRIM(c.nome)) <> 'poupança/reserva' OR c.nome IS NULL)
+          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
     """, data_inicio, data_fim)
     total_receitas = float(cursor.fetchone()[0] or 0.0)
+    
+    # Nova consulta: Receitas destinadas à Poupança no período
+    cursor.execute("""
+        SELECT SUM(t.valor) 
+        FROM Transacoes t
+        JOIN Categorias c ON t.categoria_id = c.id
+        WHERE t.tipo = 'Receita' 
+          AND t.data_transacao BETWEEN ? AND ?
+          AND LOWER(TRIM(c.nome)) = 'poupança/reserva'
+    """, data_inicio, data_fim)
+    receitas_poupanca = float(cursor.fetchone()[0] or 0.0)
     
     cursor.execute("""
         SELECT SUM(t.valor) 
         FROM Transacoes t
-        LEFT JOIN Categorias c ON t.categoria_id = c.id
         WHERE t.tipo = 'Despesa' 
           AND t.data_transacao BETWEEN ? AND ?
-          AND (LOWER(TRIM(c.nome)) <> 'poupança/reserva' OR c.nome IS NULL)
     """, data_inicio, data_fim)
     total_despesas = float(cursor.fetchone()[0] or 0.0)
     
-    # O Balanço do Período passa a ser calculado puramente com as entradas e saídas que não são poupança
-    saldo = total_receitas - total_despesas
-
+    # O saldo agora subtrai as despesas E as transferências para poupança
+    saldo = total_receitas - total_despesas - receitas_poupanca
     # 2. Saldo Total da Poupança (Acumulado Histórico - Soma Receita, Subtrai Despesa)
     cursor.execute("""
         SELECT SUM(
