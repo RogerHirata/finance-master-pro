@@ -1,12 +1,26 @@
-from fastapi import FastAPI, HTTPException, Form, Request
+from fastapi import FastAPI, HTTPException, Form, Request, Depends, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse
 import pyodbc
 import json
 from datetime import datetime, timedelta
+from contextlib import contextmanager
+from typing import Optional
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from pydantic import BaseModel
+
+# ==================== CONFIGURAÇÕES DE SEGURANÇA ====================
+
+SECRET_KEY = "your-secret-key-change-this-in-production"  # IMPORTANTE: TROCAR EM PRODUÇÃO
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 24 * 60  # 24 horas
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
-# CONFIGURAÇÃO DE CONEXÃO
+# ==================== CONFIGURAÇÃO DE CONEXÃO ====================
+
 CONN_STR = (
     "Driver={ODBC Driver 17 for SQL Server};"
     "Server=DESKTOP-JBCNUT6\\SQL_ROGER;"
@@ -14,139 +28,604 @@ CONN_STR = (
     "Trusted_Connection=yes;"
 )
 
+# ==================== CONTEXT MANAGER PARA BD ====================
+
+@contextmanager
 def get_db_connection():
-    return pyodbc.connect(CONN_STR)
+    """Context manager para garantir fechamento seguro da conexão"""
+    conn = None
+    try:
+        conn = pyodbc.connect(CONN_STR)
+        yield conn
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if conn:
+            conn.close()
 
-# --- ROTA DE EXCLUSÃO (Movida para cima para evitar conflito de leitura do FastAPI) ---
-@app.get("/web/deletar/{id}")
-def web_deletar(id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Executa a exclusão no banco de dados
-    cursor.execute("DELETE FROM Transacoes WHERE id = ?", id)
-    
-    conn.commit()
-    conn.close()
-    
-    # Redireciona limpando os filtros para atualizar os gráficos e o histórico
-    return RedirectResponse(url="/", status_code=303)
 
+# ==================== MODELOS PYDANTIC ====================
+
+class UsuarioRegistro(BaseModel):
+    email: str
+    senha: str
+    nome: str
+
+class UsuarioLogin(BaseModel):
+    email: str
+    senha: str
+
+
+# ==================== FUNÇÕES DE AUTENTICAÇÃO ====================
+
+def hash_password(password: str) -> str:
+    """Hash uma senha usando bcrypt"""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifica se a senha corresponde ao hash"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """Cria um token JWT"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: Optional[str] = Cookie(None)) -> str:
+    """Verifica o token JWT e retorna o email do usuário"""
+    if not token:
+        raise HTTPException(status_code=401, detail="Não autenticado")
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Token inválido")
+        return email
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token expirado ou inválido")
+
+def get_usuario_id_by_email(email: str) -> int:
+    """Obtém o ID do usuário pelo email"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM Usuarios WHERE email = ?", email)
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado")
+        return result[0]
+
+def usuario_existe(email: str) -> bool:
+    """Verifica se um usuário já existe"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM Usuarios WHERE email = ?", email)
+        return cursor.fetchone() is not None
+
+
+# ==================== ROTAS DE AUTENTICAÇÃO ====================
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(message: Optional[str] = None):
+    """Página de login"""
+    error_html = f'<div style="background: #ff3b3b; color: #fff; padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem; text-align: center;">{message}</div>' if message else ""
+    
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-br">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login - Finance Master Pro</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            
+            body {{
+                font-family: 'Inter', 'Segoe UI', sans-serif;
+                background: linear-gradient(135deg, #0b0c10 0%, #1f2833 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #fff;
+            }}
+            
+            .auth-container {{
+                background: #1f2833;
+                padding: 2rem;
+                border-radius: 0.8rem;
+                border: 1px solid #2f3e46;
+                width: 100%;
+                max-width: 400px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            }}
+            
+            .auth-header {{
+                text-align: center;
+                margin-bottom: 2rem;
+            }}
+            
+            .auth-header h1 {{
+                color: #45f3ff;
+                font-size: 1.8rem;
+                margin-bottom: 0.5rem;
+            }}
+            
+            .auth-header p {{
+                color: #95a5a6;
+                font-size: 0.9rem;
+            }}
+            
+            .form-group {{
+                margin-bottom: 1.5rem;
+            }}
+            
+            .form-group label {{
+                display: block;
+                font-size: 0.85rem;
+                font-weight: 600;
+                text-transform: uppercase;
+                color: #95a5a6;
+                margin-bottom: 0.5rem;
+            }}
+            
+            .form-group input {{
+                width: 100%;
+                padding: 0.75rem;
+                background: #11161d;
+                color: #fff;
+                border: 1px solid #2f3e46;
+                border-radius: 0.35rem;
+                font-size: 0.95rem;
+                transition: border-color 0.3s;
+            }}
+            
+            .form-group input:focus {{
+                outline: none;
+                border-color: #45f3ff;
+                box-shadow: 0 0 5px rgba(69, 243, 255, 0.3);
+            }}
+            
+            .btn-login {{
+                width: 100%;
+                padding: 0.85rem;
+                background: linear-gradient(135deg, #45f3ff 0%, #02f78e 100%);
+                color: #000;
+                border: none;
+                border-radius: 0.35rem;
+                font-weight: 700;
+                font-size: 1rem;
+                cursor: pointer;
+                transition: transform 0.2s;
+                margin-top: 1rem;
+            }}
+            
+            .btn-login:hover {{
+                transform: translateY(-2px);
+            }}
+            
+            .auth-link {{
+                text-align: center;
+                margin-top: 1.5rem;
+                font-size: 0.9rem;
+            }}
+            
+            .auth-link a {{
+                color: #45f3ff;
+                text-decoration: none;
+                font-weight: 600;
+            }}
+            
+            .auth-link a:hover {{
+                text-decoration: underline;
+            }}
+            
+            .error-message {{
+                background: #ff3b3b;
+                color: #fff;
+                padding: 1rem;
+                border-radius: 0.5rem;
+                margin-bottom: 1rem;
+                text-align: center;
+                font-size: 0.9rem;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="auth-container">
+            <div class="auth-header">
+                <h1><i class="fas fa-wallet"></i> Finance Master Pro</h1>
+                <p>Acesse sua conta</p>
+            </div>
+            
+            {error_html}
+            
+            <form action="/web/login" method="POST">
+                <div class="form-group">
+                    <label for="email">E-mail</label>
+                    <input type="email" id="email" name="email" placeholder="seu@email.com" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="senha">Senha</label>
+                    <input type="password" id="senha" name="senha" placeholder="••••••••" required>
+                </div>
+                
+                <button type="submit" class="btn-login">Entrar</button>
+            </form>
+            
+            <div class="auth-link">
+                Não tem conta? <a href="/cadastro">Crie uma agora</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/web/login")
+def login(email: str = Form(...), senha: str = Form(...)):
+    """Processa login do usuário"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, senha_hash FROM Usuarios WHERE email = ?", email)
+        usuario = cursor.fetchone()
+        
+        if not usuario or not verify_password(senha, usuario[1]):
+            return RedirectResponse(url="/login?message=Email ou senha inválidos", status_code=303)
+        
+        # Cria token JWT
+        access_token = create_access_token(data={"sub": email})
+        
+        # Redireciona para dashboard com token no cookie
+        response = RedirectResponse(url="/", status_code=303)
+        response.set_cookie(key="token", value=access_token, httponly=True, max_age=86400)
+        return response
+
+
+@app.get("/cadastro", response_class=HTMLResponse)
+def cadastro_page(message: Optional[str] = None):
+    """Página de cadastro"""
+    error_html = f'<div class="error-message">{message}</div>' if message else ""
+    
+    return f"""
+    <!DOCTYPE html>
+    <html lang="pt-br">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Cadastro - Finance Master Pro</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            
+            body {{
+                font-family: 'Inter', 'Segoe UI', sans-serif;
+                background: linear-gradient(135deg, #0b0c10 0%, #1f2833 100%);
+                min-height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                color: #fff;
+            }}
+            
+            .auth-container {{
+                background: #1f2833;
+                padding: 2rem;
+                border-radius: 0.8rem;
+                border: 1px solid #2f3e46;
+                width: 100%;
+                max-width: 400px;
+                box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            }}
+            
+            .auth-header {{
+                text-align: center;
+                margin-bottom: 2rem;
+            }}
+            
+            .auth-header h1 {{
+                color: #45f3ff;
+                font-size: 1.8rem;
+                margin-bottom: 0.5rem;
+            }}
+            
+            .auth-header p {{
+                color: #95a5a6;
+                font-size: 0.9rem;
+            }}
+            
+            .form-group {{
+                margin-bottom: 1.5rem;
+            }}
+            
+            .form-group label {{
+                display: block;
+                font-size: 0.85rem;
+                font-weight: 600;
+                text-transform: uppercase;
+                color: #95a5a6;
+                margin-bottom: 0.5rem;
+            }}
+            
+            .form-group input {{
+                width: 100%;
+                padding: 0.75rem;
+                background: #11161d;
+                color: #fff;
+                border: 1px solid #2f3e46;
+                border-radius: 0.35rem;
+                font-size: 0.95rem;
+                transition: border-color 0.3s;
+            }}
+            
+            .form-group input:focus {{
+                outline: none;
+                border-color: #45f3ff;
+                box-shadow: 0 0 5px rgba(69, 243, 255, 0.3);
+            }}
+            
+            .btn-cadastro {{
+                width: 100%;
+                padding: 0.85rem;
+                background: linear-gradient(135deg, #02f78e 0%, #45f3ff 100%);
+                color: #000;
+                border: none;
+                border-radius: 0.35rem;
+                font-weight: 700;
+                font-size: 1rem;
+                cursor: pointer;
+                transition: transform 0.2s;
+                margin-top: 1rem;
+            }}
+            
+            .btn-cadastro:hover {{
+                transform: translateY(-2px);
+            }}
+            
+            .auth-link {{
+                text-align: center;
+                margin-top: 1.5rem;
+                font-size: 0.9rem;
+            }}
+            
+            .auth-link a {{
+                color: #45f3ff;
+                text-decoration: none;
+                font-weight: 600;
+            }}
+            
+            .auth-link a:hover {{
+                text-decoration: underline;
+            }}
+            
+            .error-message {{
+                background: #ff3b3b;
+                color: #fff;
+                padding: 1rem;
+                border-radius: 0.5rem;
+                margin-bottom: 1rem;
+                text-align: center;
+                font-size: 0.9rem;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="auth-container">
+            <div class="auth-header">
+                <h1><i class="fas fa-wallet"></i> Finance Master Pro</h1>
+                <p>Crie sua conta</p>
+            </div>
+            
+            {error_html}
+            
+            <form action="/web/cadastro" method="POST">
+                <div class="form-group">
+                    <label for="nome">Nome Completo</label>
+                    <input type="text" id="nome" name="nome" placeholder="Seu nome" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="email">E-mail</label>
+                    <input type="email" id="email" name="email" placeholder="seu@email.com" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="senha">Senha</label>
+                    <input type="password" id="senha" name="senha" placeholder="••••••••" minlength="6" required>
+                </div>
+                
+                <button type="submit" class="btn-cadastro">Criar Conta</button>
+            </form>
+            
+            <div class="auth-link">
+                Já tem conta? <a href="/login">Faça login</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.post("/web/cadastro")
+def cadastro(nome: str = Form(...), email: str = Form(...), senha: str = Form(...)):
+    """Processa cadastro de novo usuário"""
+    
+    # Validações básicas
+    if len(senha) < 6:
+        return RedirectResponse(url="/cadastro?message=Senha deve ter pelo menos 6 caracteres", status_code=303)
+    
+    if usuario_existe(email):
+        return RedirectResponse(url="/cadastro?message=Email já cadastrado", status_code=303)
+    
+    # Insere novo usuário
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            senha_hash = hash_password(senha)
+            cursor.execute(
+                "INSERT INTO Usuarios (email, senha_hash, nome) VALUES (?, ?, ?)",
+                email, senha_hash, nome
+            )
+            conn.commit()
+        
+        return RedirectResponse(url="/login?message=Cadastro realizado com sucesso! Faça login", status_code=303)
+    except Exception as e:
+        return RedirectResponse(url="/cadastro?message=Erro ao criar conta. Tente novamente", status_code=303)
+
+@app.get("/logout")
+def logout():
+    """Faz logout do usuário"""
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(key="token")
+    return response
+
+
+
+
+# ==================== ROTAS PROTEGIDAS DO DASHBOARD ====================
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard_executivo(
     edit_id: int = None, 
     data_inicio: str = None, 
-    data_fim: str = None
+    data_fim: str = None,
+    token: Optional[str] = Cookie(None)
 ):
+    """Dashboard principal - protegido por autenticação"""
+    
+    # Verifica autenticação
+    if not token:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    try:
+        email = verify_token(token)
+        usuario_id = get_usuario_id_by_email(email)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=303)
+    
     hoje = datetime.today()
     hoje_str = hoje.strftime('%Y-%m-%d')
     
-    # Se não houver filtro na URL, define o período apenas para o DIA ATUAL
     if not data_inicio or data_inicio.strip() == "":
         data_inicio = hoje_str
     if not data_fim or data_fim.strip() == "":
         data_fim = hoje_str
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 1. Resumo Financeiro Geral Filtrado pelo Dia/Período (Ignora a Categoria Poupança/Reserva)
-    cursor.execute("""
-        SELECT SUM(t.valor) 
-        FROM Transacoes t
-        JOIN Categorias c ON t.categoria_id = c.id
-        WHERE t.tipo = 'Receita' 
-          AND t.data_transacao BETWEEN ? AND ?
-          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
-    """, data_inicio, data_fim)
-    total_receitas = float(cursor.fetchone()[0] or 0.0)
-    
-    # Nova consulta: Receitas destinadas à Poupança no período
-    cursor.execute("""
-        SELECT SUM(t.valor) 
-        FROM Transacoes t
-        JOIN Categorias c ON t.categoria_id = c.id
-        WHERE t.tipo = 'Receita' 
-          AND t.data_transacao BETWEEN ? AND ?
-          AND LOWER(TRIM(c.nome)) = 'poupança/reserva'
-    """, data_inicio, data_fim)
-    receitas_poupanca = float(cursor.fetchone()[0] or 0.0)
-    
-    cursor.execute("""
-        SELECT SUM(t.valor) 
-        FROM Transacoes t
-        WHERE t.tipo = 'Despesa' 
-          AND t.data_transacao BETWEEN ? AND ?
-    """, data_inicio, data_fim)
-    total_despesas = float(cursor.fetchone()[0] or 0.0)
-    
-    # O saldo agora subtrai as despesas E as transferências para poupança
-    saldo = total_receitas - total_despesas - receitas_poupanca
-    # 2. Saldo Total da Poupança (Acumulado Histórico - Soma Receita, Subtrai Despesa)
-    cursor.execute("""
-        SELECT SUM(
-            CASE 
-                WHEN LOWER(TRIM(t.tipo)) = 'receita' THEN t.valor 
-                WHEN LOWER(TRIM(t.tipo)) = 'despesa' THEN -t.valor 
-                ELSE 0 
-            END
-        )
-        FROM Transacoes t 
-        JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE LOWER(TRIM(c.nome)) = 'poupança/reserva'
-    """)
-    total_poupanca = float(cursor.fetchone()[0] or 0.0)
-    
-    # 3. Dados Gráfico 1: Rosca (Gastos por Categoria no Período - Ignora Poupança para focar em despesas reais)
-    cursor.execute("""
-        SELECT c.nome, SUM(t.valor) 
-        FROM Transacoes t 
-        JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE t.tipo = 'Despesa' 
-          AND t.data_transacao BETWEEN ? AND ?
-          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
-        GROUP BY c.nome
-    """, data_inicio, data_fim)
-    resumo_gastos = cursor.fetchall()
-    labels_rosca = [r[0] for r in resumo_gastos]
-    values_rosca = [float(r[1]) for r in resumo_gastos]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        # 1. Resumo Financeiro Geral Filtrado pelo Dia/Período (Ignora Poupança) - APENAS DADOS DO USUÁRIO
+        cursor.execute("""
+            SELECT SUM(t.valor) 
+            FROM Transacoes t
+            JOIN Categorias c ON t.categoria_id = c.id
+            WHERE t.tipo = 'Receita' 
+              AND t.data_transacao BETWEEN ? AND ?
+              AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
+              AND t.usuario_id = ?
+        """, data_inicio, data_fim, usuario_id)
+        total_receitas = float(cursor.fetchone()[0] or 0.0)
+        
+        # Receitas destinadas à Poupança no período
+        cursor.execute("""
+            SELECT SUM(t.valor) 
+            FROM Transacoes t
+            JOIN Categorias c ON t.categoria_id = c.id
+            WHERE t.tipo = 'Receita' 
+              AND t.data_transacao BETWEEN ? AND ?
+              AND LOWER(TRIM(c.nome)) = 'poupança/reserva'
+              AND t.usuario_id = ?
+        """, data_inicio, data_fim, usuario_id)
+        receitas_poupanca = float(cursor.fetchone()[0] or 0.0)
+        
+        cursor.execute("""
+            SELECT SUM(t.valor) 
+            FROM Transacoes t
+            WHERE t.tipo = 'Despesa' 
+              AND t.data_transacao BETWEEN ? AND ?
+              AND t.usuario_id = ?
+        """, data_inicio, data_fim, usuario_id)
+        total_despesas = float(cursor.fetchone()[0] or 0.0)
+        
+        saldo = total_receitas - total_despesas - receitas_poupanca
+        
+        # 2. Saldo Total da Poupança (Acumulado Histórico)
+        cursor.execute("""
+            SELECT SUM(
+                CASE 
+                    WHEN LOWER(TRIM(t.tipo)) = 'receita' THEN t.valor 
+                    WHEN LOWER(TRIM(t.tipo)) = 'despesa' THEN -t.valor 
+                    ELSE 0 
+                END
+            )
+            FROM Transacoes t 
+            JOIN Categorias c ON t.categoria_id = c.id 
+            WHERE LOWER(TRIM(c.nome)) = 'poupança/reserva'
+              AND t.usuario_id = ?
+        """, usuario_id)
+        total_poupanca = float(cursor.fetchone()[0] or 0.0)
+        
+        # 3. Dados Gráfico 1: Rosca (Gastos por Categoria - Ignora Poupança)
+        cursor.execute("""
+            SELECT c.nome, SUM(t.valor) 
+            FROM Transacoes t 
+            JOIN Categorias c ON t.categoria_id = c.id 
+            WHERE t.tipo = 'Despesa' 
+              AND t.data_transacao BETWEEN ? AND ?
+              AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
+              AND t.usuario_id = ?
+            GROUP BY c.nome
+        """, data_inicio, data_fim, usuario_id)
+        resumo_gastos = cursor.fetchall()
+        labels_rosca = [r[0] for r in resumo_gastos]
+        values_rosca = [float(r[1]) for r in resumo_gastos]
 
-    # 4. Dados Gráfico 2: Ranking Top 5 (Ignora Poupança)
-    cursor.execute("""
-        SELECT TOP 5 c.nome, SUM(t.valor) 
-        FROM Transacoes t 
-        JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE t.tipo = 'Despesa' 
-          AND t.data_transacao BETWEEN ? AND ?
-          AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
-        GROUP BY c.nome 
-        ORDER BY SUM(t.valor) DESC
-    """, data_inicio, data_fim)
-    ranking = cursor.fetchall()
-    labels_rank = [r[0] for r in ranking]
-    values_rank = [float(r[1]) for r in ranking]
+        # 4. Dados Gráfico 2: Ranking Top 5
+        cursor.execute("""
+            SELECT TOP 5 c.nome, SUM(t.valor) 
+            FROM Transacoes t 
+            JOIN Categorias c ON t.categoria_id = c.id 
+            WHERE t.tipo = 'Despesa' 
+              AND t.data_transacao BETWEEN ? AND ?
+              AND LOWER(TRIM(c.nome)) <> 'poupança/reserva'
+              AND t.usuario_id = ?
+            GROUP BY c.nome 
+            ORDER BY SUM(t.valor) DESC
+        """, data_inicio, data_fim, usuario_id)
+        ranking = cursor.fetchall()
+        labels_rank = [r[0] for r in ranking]
+        values_rank = [float(r[1]) for r in ranking]
 
-    # 5. Histórico de Transações do Período (Mantém a exibição da Poupança na tabela para controle do histórico)
-    cursor.execute("""
-        SELECT t.id, t.descricao, t.valor, t.tipo, c.nome, CONVERT(VARCHAR, t.data_transacao, 103) 
-        FROM Transacoes t 
-        JOIN Categorias c ON t.categoria_id = c.id 
-        WHERE t.data_transacao BETWEEN ? AND ?
-        ORDER BY t.data_transacao DESC, t.id DESC
-    """, data_inicio, data_fim)
-    historico = cursor.fetchall()
-    
-    # Busca a lista de categorias ordenada alfabeticamente para o formulário
-    cursor.execute("SELECT id, nome FROM Categorias ORDER BY nome")
-    categorias_lista = cursor.fetchall()
+        # 5. Histórico de Transações do Período
+        cursor.execute("""
+            SELECT t.id, t.descricao, t.valor, t.tipo, c.nome, CONVERT(VARCHAR, t.data_transacao, 103) 
+            FROM Transacoes t 
+            JOIN Categorias c ON t.categoria_id = c.id 
+            WHERE t.data_transacao BETWEEN ? AND ?
+              AND t.usuario_id = ?
+            ORDER BY t.data_transacao DESC, t.id DESC
+        """, data_inicio, data_fim, usuario_id)
+        historico = cursor.fetchall()
+        
+        # Busca lista de categorias
+        cursor.execute("SELECT id, nome FROM Categorias ORDER BY nome")
+        categorias_lista = cursor.fetchall()
 
-    edit_item = None
-    if edit_id:
-        cursor.execute("SELECT id, descricao, valor, tipo, categoria_id, data_transacao FROM Transacoes WHERE id = ?", edit_id)
-        edit_item = cursor.fetchone()
-
-    conn.close()
+        edit_item = None
+        if edit_id:
+            cursor.execute(
+                "SELECT id, descricao, valor, tipo, categoria_id, data_transacao FROM Transacoes WHERE id = ? AND usuario_id = ?", 
+                edit_id, usuario_id
+            )
+            edit_item = cursor.fetchone()
 
     data_padrao_form = edit_item[5].strftime('%Y-%m-%d') if edit_item else hoje_str
 
@@ -214,6 +693,36 @@ def dashboard_executivo(
                 align-items: center;
             }}
             .navbar h2 {{ margin: 0; font-size: 1.4rem; color: var(--primary); }}
+            
+            .navbar-right {{
+                display: flex;
+                gap: 2rem;
+                align-items: center;
+            }}
+            
+            .user-info {{
+                display: flex;
+                align-items: center;
+                gap: 0.8rem;
+                font-size: 0.9rem;
+                color: var(--text-muted);
+            }}
+            
+            .logout-btn {{
+                padding: 0.5rem 1rem;
+                background: var(--danger);
+                color: #fff;
+                border: none;
+                border-radius: 0.35rem;
+                cursor: pointer;
+                font-size: 0.85rem;
+                text-decoration: none;
+                display: inline-block;
+            }}
+            
+            .logout-btn:hover {{
+                background: #ff5252;
+            }}
 
             .main-layout {{
                 max-width: 1400px;
@@ -324,7 +833,13 @@ def dashboard_executivo(
     <body>
         <div class="navbar">
             <h2><i class="fas fa-wallet"></i> Finance Master Pro</h2>
-            <span style="color: var(--text-muted); font-size: 0.85rem;"><i class="fas fa-circle" style="color: var(--success); font-size: 0.6rem;"></i> Banco de Dados Conectado</span>
+            <div class="navbar-right">
+                <div class="user-info">
+                    <i class="fas fa-user-circle"></i>
+                    <span>{email}</span>
+                </div>
+                <a href="/logout" class="logout-btn">Logout</a>
+            </div>
         </div>
         
         <div class="main-layout">
@@ -443,6 +958,38 @@ def dashboard_executivo(
     </html>
     """
 
+
+
+@app.get("/web/deletar/{id}")
+def web_deletar(id: int, token: Optional[str] = Cookie(None)):
+    """Deleta uma transação (protegido por autenticação)"""
+    
+    if not token:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    try:
+        email = verify_token(token)
+        usuario_id = get_usuario_id_by_email(email)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=303)
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Verifica se a transação pertence ao usuário (SEGURANÇA)
+        cursor.execute("SELECT usuario_id FROM Transacoes WHERE id = ?", id)
+        resultado = cursor.fetchone()
+        
+        if not resultado or resultado[0] != usuario_id:
+            return RedirectResponse(url="/", status_code=303)
+        
+        # Executa a exclusão
+        cursor.execute("DELETE FROM Transacoes WHERE id = ?", id)
+        conn.commit()
+    
+    return RedirectResponse(url="/", status_code=303)
+
+
 @app.post("/web/salvar")
 def web_salvar(
     id: str = Form(None), 
@@ -450,21 +997,43 @@ def web_salvar(
     valor: float = Form(...), 
     tipo: str = Form(...), 
     categoria_id: int = Form(...),
-    data_transacao: str = Form(...)
+    data_transacao: str = Form(...),
+    token: Optional[str] = Cookie(None)
 ):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    if id and id != "":
-        cursor.execute("""
-            UPDATE Transacoes 
-            SET descricao=?, valor=?, tipo=?, categoria_id=?, data_transacao=? 
-            WHERE id=?
-        """, descricao, valor, tipo, categoria_id, data_transacao, id)
-    else:
-        cursor.execute("""
-            INSERT INTO Transacoes (descricao, valor, tipo, categoria_id, data_transacao) 
-            VALUES (?, ?, ?, ?, ?)
-        """, descricao, valor, tipo, categoria_id, data_transacao)
-    conn.commit()
-    conn.close()
+    """Salva uma transação (protegido por autenticação)"""
+    
+    if not token:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    try:
+        email = verify_token(token)
+        usuario_id = get_usuario_id_by_email(email)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=303)
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        if id and id != "":
+            # ATUALIZAR: Verifica se pertence ao usuário (SEGURANÇA)
+            cursor.execute("SELECT usuario_id FROM Transacoes WHERE id = ?", id)
+            resultado = cursor.fetchone()
+            
+            if not resultado or resultado[0] != usuario_id:
+                return RedirectResponse(url="/", status_code=303)
+            
+            cursor.execute("""
+                UPDATE Transacoes 
+                SET descricao=?, valor=?, tipo=?, categoria_id=?, data_transacao=? 
+                WHERE id=?
+            """, descricao, valor, tipo, categoria_id, data_transacao, id)
+        else:
+            # INSERTAR: Adiciona usuario_id automaticamente
+            cursor.execute("""
+                INSERT INTO Transacoes (descricao, valor, tipo, categoria_id, data_transacao, usuario_id) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, descricao, valor, tipo, categoria_id, data_transacao, usuario_id)
+        
+        conn.commit()
+    
     return RedirectResponse(url="/", status_code=303)
