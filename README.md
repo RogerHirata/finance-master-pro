@@ -24,17 +24,14 @@ Exemplo de lugar para colar o link do YouTube ou o GIF hospedado:
 
 Suba as imagens em `assets/screenshots/` e atualize os paths abaixo.
 
-- **Tela de Login**
+### Tela de Login
+![Tela de Login](assets/screenshots/login.png)
 
-        ![Tela de Login](assets/screenshots/login.png)
+### Tela de Cadastro
+![Tela de Cadastro](assets/screenshots/register.png)
 
-- **Tela de Cadastro**
-
-        ![Tela de Cadastro](assets/screenshots/register.png)
-
-- **Dashboard Principal**
-
-        ![Dashboard Principal](assets/screenshots/dashboard.png)
+### Dashboard Principal
+![Dashboard Principal](assets/screenshots/dashboard.png)
 
 Substitua os arquivos acima com prints reais antes de publicar no GitHub.
 
