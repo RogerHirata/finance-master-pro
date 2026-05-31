@@ -4,19 +4,13 @@ README profissional para apresentação em GitHub
 -->
 # Finance Master Pro v2.0
 
+## 🎥 Demonstração em Vídeo
+
+Assista ao vídeo completo demonstrando o fluxo do sistema (Cadastro, Login e o Dashboard Principal):
+
+▶️ [Clique aqui para assistir à demonstração no Google Drive](https://drive.google.com/file/d/1LZRY9DuA1-Y_qoItA7A12WVdusCi-HxH/view?usp=sharing)
+
 > Finance Master Pro é um sistema de controle financeiro multi-usuário moderno, seguro e focado em privacidade dos dados. Desenvolvido como uma vitrine profissional para gerir transações pessoais e empresariais com visual agradável (Dark Mode), gráficos dinâmicos, e isolamento completo de dados por usuário.
-
----
-
-## 🚀 Demonstração em Vídeo
-
-Cole aqui o link do vídeo ou GIF que demonstra o fluxo principal: Login → Cadastro → Dashboard → Gráficos.
-
-Exemplo de lugar para colar o link do YouTube ou o GIF hospedado:
-
-**Link do vídeo / GIF:** [COLE_AQUI_O_LINK_DO_VIDEO_OU_GIF]
-
-> Dica: Grave um GIF curto (10–30s) mostrando o login, criação de conta e a visualização do dashboard. Use ferramentas como ShareX, Loom ou a gravação do próprio YouTube.
 
 ---
 
